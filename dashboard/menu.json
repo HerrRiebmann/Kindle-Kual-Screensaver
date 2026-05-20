@@ -1,0 +1,25 @@
+{
+  "items": [
+    {
+      "name": "Dashboard",
+      "items": [
+        {
+          "name": "Update now",
+          "action": "/bin/sh /mnt/us/extensions/dashboard/update.sh"
+        },
+        {
+          "name": "Start auto refresh",
+          "action": "/bin/sh /mnt/us/extensions/dashboard/auto.sh"
+        },
+        {
+          "name": "Stop auto refresh",
+          "action": "/bin/sh /mnt/us/extensions/dashboard/stop.sh"
+        },
+        {
+          "name": "Test",
+          "action": "/bin/sh /mnt/us/extensions/dashboard/test.sh"
+        }
+      ]
+    }
+  ]
+}
