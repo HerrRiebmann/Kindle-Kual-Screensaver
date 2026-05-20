@@ -103,3 +103,8 @@ The extension exposes four actions through KUAL:
 The dashboard server should respond to `GET /?batteryLevel=<0-100>&isCharging=<Yes|No>` with a PNG image sized to match the Kindle's screen resolution (e.g., 1024×758 for PW3).
 
 Sending the batterylevel reqires to setup an endpoint on Home Assistant [Kindle Screensaver Webhook](https://github.com/sibbl/hass-lovelace-kindle-screensaver#how-to-set-up-the-webhook)
+
+## Problems
+Ending the Dashboard mode requires using the hardware button. Then tap on the top for bringing the menu into the front.
+Then the script can be stopped. This sometimes does not brings you back to the main Kindle screen. Then just restart the device 🤷🏻‍♂️
+- Working on this right now.
