@@ -79,14 +79,24 @@ wifi_on() {
     killall -CONT powerd 2>/dev/null
     sleep 1
 
+    # Ensure clean state: kill any stale wpa_supplicant left from a
+    # previous failed recovery cycle. A leftover daemon blocks the
+    # framework from starting its own, causing all future connects to fail.
+    if pidof wpa_supplicant >/dev/null 2>&1; then
+        log "wifi_on: killing stale wpa_supplicant from previous cycle"
+        killall wpa_supplicant 2>/dev/null
+        sleep 1
+    fi
+
     # Log current WiFi state before attempting connection
     CM_PRE=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
     log "wifi_on: pre-enable cmState='$CM_PRE'"
 
-    # Try up to 3 attempts with increasingly aggressive resets:
+    # Try up to 4 attempts with increasingly aggressive resets:
     # 1) Normal enable  2) lipc power-cycle  3) Kernel-level driver reset
+    # 4) rfkill hardware power-cycle
     ATTEMPT=1
-    MAX_ATTEMPTS=3
+    MAX_ATTEMPTS=4
     while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
         log "wifi_on: attempt $ATTEMPT/$MAX_ATTEMPTS - enabling wireless"
         lipc-set-prop com.lab126.cmd wirelessEnable 1
@@ -149,11 +159,32 @@ wifi_on() {
                 wpa_cli -i wlan0 reassociate 2>/dev/null
             fi
             sleep 2
+        elif [ $ATTEMPT -eq 3 ]; then
+            # Attempt 3 failed: rfkill hardware power-cycle
+            # This cuts power to the WiFi chip via GPIO, which can recover
+            # a hung chip firmware that software resets cannot fix.
+            log "wifi_on: RFKILL power-cycle - cutting chip power via GPIO"
+            lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
+            sleep 1
+            rfkill block wifi 2>/dev/null
+            sleep 3
+            rfkill unblock wifi 2>/dev/null
+            sleep 3
+            # Bring interface back up after hardware power-cycle
+            ifconfig wlan0 up 2>/dev/null
+            sleep 2
+            # Ensure wpa_supplicant is running
+            if ! pidof wpa_supplicant >/dev/null 2>&1; then
+                log "wifi_on: restarting wpa_supplicant after rfkill"
+                wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null \
+                    || wpa_supplicant -B -i wlan0 -c /var/run/wpa_supplicant.conf 2>/dev/null
+                sleep 2
+            fi
         fi
 
         ATTEMPT=$((ATTEMPT + 1))
     done
-    log "wifi_on: FAILED to connect after $MAX_ATTEMPTS attempts"
+    log "wifi_on: FAILED to connect after $MAX_ATTEMPTS attempts (incl. rfkill)"
     return 1
 }
 
@@ -166,9 +197,16 @@ wifi_off() {
     # Disable WiFi – powerd stays running so it can properly manage
     # the WiFi chip power state during suspend/resume.
     lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
-
-    # Give powerd a moment to cleanly power down the WiFi chip
     sleep 1
+
+    # Clean up any leftover state from failed recovery attempts.
+    # The aggressive escalation (attempts 2-4) manually starts
+    # wpa_supplicant and manipulates rfkill/ifconfig. These changes
+    # bypass the framework and persist across suspend/resume, causing
+    # the NEXT wifi_on to fail permanently.
+    killall wpa_supplicant 2>/dev/null
+    rfkill unblock wifi 2>/dev/null
+    ifconfig wlan0 down 2>/dev/null
 }
 
 # Returns the interval in minutes based on time of day
@@ -295,6 +333,7 @@ post_wake() {
     # the kernel may switch the framebuffer format (e.g. 8bpp -> 32bpp)
     # causing black screen + stripe artifacts. fbdepth forces it back
     # to 8bpp grayscale which fbink expects.
+    FB_BPP_BEFORE=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
     log "post_wake: resetting framebuffer depth"
     $BASEDIR/bin/fbdepth -d 8 2>/dev/null
 
@@ -302,13 +341,28 @@ post_wake() {
     FB_STATE=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
     log "post_wake: fb0 bpp=$FB_STATE"
 
-    # Wake up the e-ink display controller. After suspend-to-RAM the
-    # controller is powered off and won't push framebuffer changes to the
-    # physical panel until it receives a refresh command. A full clear
-    # (-c -f) forces a hardware refresh that brings the panel back online.
-    log "post_wake: waking e-ink controller"
-    $FBINK -c -f
-    sleep 2
+    # If bit depth actually changed, the framebuffer content is corrupted.
+    # Repaint the last image so the display isn't garbled.
+    FB_CHANGED=0
+    if [ "$FB_BPP_BEFORE" != "8" ] && [ -f "$IMG" ]; then
+        log "post_wake: bpp changed ($FB_BPP_BEFORE->8), repainting last image"
+        $FBINK -q -f -g file="$IMG"
+        FB_CHANGED=1
+    fi
+
+    # NOTE: Do NOT clear the screen here. The e-ink panel retains its
+    # image across suspend-to-RAM without power. Clearing would destroy
+    # the displayed dashboard and force a repaint even when WiFi fails.
+    # The EPDC wakes automatically when the next fbink draw command is
+    # issued (in update.sh on successful fetch).
+    log "post_wake: e-ink ready (image retained)"
+
+    # Thaw blanket briefly so it can process D-Bus unload commands.
+    # If blanket is still SIGSTOP'd from the previous wifi_off(), lipc
+    # commands would hang until timeout (~7s each), delaying wifi_on and
+    # destabilising the WiFi stack.
+    killall -CONT blanket 2>/dev/null
+    sleep 1
 
     # Re-disable Pillow UI overlay and blanket modules
     lipc-set-prop com.lab126.pillow disableEnablePillow disable 2>/dev/null
@@ -345,10 +399,7 @@ do
         log "Fetching dashboard image"
         sh /mnt/us/extensions/dashboard/update.sh
     else
-        log "WiFi failed, repainting last image"
-        if [ -f "$IMG" ]; then
-            $FBINK -q -g file="$IMG"
-        fi
+        log "WiFi failed, skipping refresh (e-ink retains last image)"
     fi
     wifi_off
     log "Suspending immediately"

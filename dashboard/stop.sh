@@ -2,6 +2,7 @@
 
 BASEDIR="/mnt/us/extensions/dashboard"
 PIDFILE="$BASEDIR/pid"
+FBINK="$BASEDIR/bin/fbink"
 
 if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")
@@ -24,43 +25,53 @@ if [ -f "$PIDFILE" ]; then
     rm -f "$PIDFILE"
 fi
 
-# Safety net: restore critical state even if the subshell trap didn't fire
+# Safety net: restore critical state even if the subshell trap didn't fire.
+# Order matters! Hardware state first, then UI framework, then processes.
 
-# Thaw ALL frozen processes first so they can respond to state changes
-killall -CONT blanket 2>/dev/null
+# --- 1. Thaw powerd (manages all hardware) ---
 killall -CONT powerd 2>/dev/null
-killall -CONT mesquite 2>/dev/null
+sleep 1
 
-# Clear any pending RTC wake alarm
+# --- 2. Clear any pending RTC wake alarm ---
 [ -e /sys/class/rtc/rtc0/wakealarm ] && echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
 
-# Restore framebuffer to native bit depth (usually 32bpp).
-# auto.sh forces 8bpp via fbdepth; the framework expects the native depth.
-BASEDIR="/mnt/us/extensions/dashboard"
+# --- 3. Restore framebuffer to native bit depth BEFORE any UI draws ---
+# auto.sh forces 8bpp via fbdepth; the framework expects 32bpp.
 if [ -x "$BASEDIR/bin/fbdepth" ]; then
     $BASEDIR/bin/fbdepth -d 32 2>/dev/null
 fi
 
-# Re-enable frontlight hardware (user can adjust brightness from settings)
+# --- 4. Wake e-ink controller ---
+# After suspend cycles the controller is powered off and won't push
+# framebuffer changes to the panel. A clear+flash wakes it up.
+if [ -x "$FBINK" ]; then
+    $FBINK -c -f 2>/dev/null
+fi
+
+# --- 5. Re-enable frontlight hardware ---
 for bp in /sys/class/backlight/*/bl_power; do
     [ -e "$bp" ] && echo 0 > "$bp" 2>/dev/null   # FB_BLANK_UNBLANK = 0
 done
 lipc-set-prop com.lab126.powerd flEnable 1 2>/dev/null
 
-# Re-enable Pillow UI overlay
-lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
+# --- 6. Restore power management settings ---
+# NOTE: Do NOT set preventScreenSaver 0 yet! powerd's inactivity timer
+# has been running the entire time auto.sh was active (hours/days).
+# If we allow screensaver now, powerd immediately triggers sleep.
+# We'll reset the idle timer and release the screensaver lock at the end.
+echo 1 > /sys/power/hibernate_allowed 2>/dev/null
 
-# Reload blanket modules (screensaver + status bar)
+# --- 7. Re-enable WiFi ---
+lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
+
+# --- 8. Thaw blanket, re-enable Pillow, reload modules ---
+killall -CONT blanket 2>/dev/null
+sleep 1
+lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
 lipc-set-prop com.lab126.blanket load screensaver 2>/dev/null
 lipc-set-prop com.lab126.blanket load active_status_bar 2>/dev/null
 
-# Allow screensaver again
-lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null
-
-# Re-enable WiFi
-lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
-
-# Restart services that were stopped by auto.sh
+# --- 9. Restart services that were stopped by auto.sh ---
 start otaupd 2>/dev/null
 start phd 2>/dev/null
 start tmd 2>/dev/null
@@ -69,9 +80,22 @@ start todo 2>/dev/null
 start archive 2>/dev/null
 start searchd 2>/dev/null
 
-# Give blanket/pillow a moment to redraw, then trigger a full screen refresh
-# to clear the stale fbink image and show the normal Kindle UI
-sleep 3
-if [ -x "$BASEDIR/bin/fbink" ]; then
-    $BASEDIR/bin/fbink -c -f 2>/dev/null
+# --- 10. Thaw mesquite LAST so it redraws into a fully prepared fb ---
+killall -CONT mesquite 2>/dev/null
+
+# Give mesquite + blanket time to redraw the home screen and status bar
+sleep 5
+
+# --- 11. Final full-screen refresh to push everything to the e-ink panel ---
+if [ -x "$FBINK" ]; then
+    $FBINK -f -s 2>/dev/null
 fi
+
+# --- 12. Reset powerd idle timer, THEN allow screensaver ---
+# Simulate user activity so powerd starts counting from zero.
+# Without this, powerd would immediately trigger sleep because the
+# accumulated idle time (from hours of auto.sh) exceeds the threshold.
+lipc-set-prop com.lab126.powerd wakeUp 1 2>/dev/null
+lipc-send-event com.lab126.powerd wakeUp 2>/dev/null
+# Now it's safe to allow the screensaver again
+lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null
