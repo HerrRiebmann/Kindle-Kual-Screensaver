@@ -92,11 +92,12 @@ wifi_on() {
     CM_PRE=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
     log "wifi_on: pre-enable cmState='$CM_PRE'"
 
-    # Try up to 4 attempts with increasingly aggressive resets:
+    # Try up to 6 attempts with increasingly aggressive resets:
     # 1) Normal enable  2) lipc power-cycle  3) Kernel-level driver reset
-    # 4) rfkill hardware power-cycle
+    # 4) rfkill hardware power-cycle  5) Restart wifid daemon
+    # 6) Bypass framework: manual wpa_supplicant + DHCP
     ATTEMPT=1
-    MAX_ATTEMPTS=4
+    MAX_ATTEMPTS=6
     while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
         log "wifi_on: attempt $ATTEMPT/$MAX_ATTEMPTS - enabling wireless"
         lipc-set-prop com.lab126.cmd wirelessEnable 1
@@ -180,11 +181,92 @@ wifi_on() {
                     || wpa_supplicant -B -i wlan0 -c /var/run/wpa_supplicant.conf 2>/dev/null
                 sleep 2
             fi
+        elif [ $ATTEMPT -eq 4 ]; then
+            # Attempt 4 failed: restart the wifid daemon entirely.
+            # The framework state machine can get permanently stuck in a
+            # state where it refuses to connect. Restarting wifid resets
+            # its internal state without a full reboot.
+            log "wifi_on: RESTARTING wifid daemon"
+            lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
+            killall wpa_supplicant 2>/dev/null
+            stop wifid 2>/dev/null
+            sleep 3
+            start wifid 2>/dev/null
+            sleep 3
+        elif [ $ATTEMPT -eq 5 ]; then
+            # Attempt 5 failed: bypass the Kindle framework entirely.
+            # Connect directly with wpa_supplicant + DHCP, ignoring wifid/lipc.
+            # This works even when the framework is completely broken.
+            log "wifi_on: BYPASS FRAMEWORK - manual wpa_supplicant + DHCP"
+            lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
+            stop wifid 2>/dev/null
+            killall wpa_supplicant 2>/dev/null
+            killall udhcpc 2>/dev/null
+            sleep 2
+
+            # Reset hardware
+            rfkill unblock wifi 2>/dev/null
+            ifconfig wlan0 up 2>/dev/null
+            sleep 2
+
+            # Find wpa_supplicant config
+            WPA_CONF=""
+            for f in /etc/wpa_supplicant/wpa_supplicant.conf \
+                     /var/run/wpa_supplicant.conf \
+                     /etc/wpa_supplicant.conf \
+                     /mnt/us/extensions/dashboard/wpa_supplicant.conf; do
+                if [ -f "$f" ]; then
+                    WPA_CONF="$f"
+                    break
+                fi
+            done
+
+            if [ -n "$WPA_CONF" ]; then
+                log "wifi_on: manual connect using $WPA_CONF"
+                wpa_supplicant -B -i wlan0 -c "$WPA_CONF" 2>/dev/null
+                sleep 3
+
+                # Wait for association (up to 15s)
+                ASSOC_TRIES=0
+                while [ $ASSOC_TRIES -lt 15 ]; do
+                    if wpa_cli -i wlan0 status 2>/dev/null | grep -q "wpa_state=COMPLETED"; then
+                        log "wifi_on: manual association successful"
+                        break
+                    fi
+                    sleep 1
+                    ASSOC_TRIES=$((ASSOC_TRIES + 1))
+                done
+
+                # Get IP via DHCP
+                if wpa_cli -i wlan0 status 2>/dev/null | grep -q "wpa_state=COMPLETED"; then
+                    udhcpc -i wlan0 -t 5 -T 3 -n -q 2>/dev/null
+                    sleep 2
+                    # Check if we got an IP
+                    if ifconfig wlan0 2>/dev/null | grep -q "inet addr"; then
+                        log "wifi_on: MANUAL CONNECTION SUCCESSFUL (bypassed framework)"
+                        # Restart wifid so wifi_off() works normally
+                        start wifid 2>/dev/null
+                        sleep 1
+                        return 0
+                    fi
+                    log "wifi_on: DHCP failed in manual mode"
+                else
+                    log "wifi_on: manual association failed after 15s"
+                fi
+            else
+                log "wifi_on: no wpa_supplicant.conf found for manual mode"
+            fi
+
+            # Clean up failed manual attempt, restart wifid for next cycle
+            killall wpa_supplicant 2>/dev/null
+            killall udhcpc 2>/dev/null
+            start wifid 2>/dev/null
+            sleep 2
         fi
 
         ATTEMPT=$((ATTEMPT + 1))
     done
-    log "wifi_on: FAILED to connect after $MAX_ATTEMPTS attempts (incl. rfkill)"
+    log "wifi_on: FAILED to connect after $MAX_ATTEMPTS attempts (incl. rfkill, wifid restart, manual bypass)"
     return 1
 }
 
@@ -388,6 +470,7 @@ COUNTER=1
 while true
 do
     SLEEP_SECONDS=$(get_seconds_to_next_slot)
+    SLEEP_SECONDS=$((SLEEP_SECONDS + 5))  # Wake 5s after cron boundary so HA has rendered
     do_suspend $SLEEP_SECONDS
 
     # --- Device just woke up ---
