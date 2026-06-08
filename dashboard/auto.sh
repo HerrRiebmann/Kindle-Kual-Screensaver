@@ -72,223 +72,140 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
 }
 
+# Track consecutive WiFi failures
+WIFI_FAIL_COUNT=0
+
+# Detect which WiFi kernel module drives wlan0.
+# This lets us do clean rmmod/modprobe around suspend cycles.
+detect_wifi_module() {
+    # Method 1: follow the sysfs driver symlink (most reliable)
+    if [ -e /sys/class/net/wlan0/device/driver/module ]; then
+        _m=$(basename "$(readlink /sys/class/net/wlan0/device/driver/module)" 2>/dev/null)
+        if [ -n "$_m" ]; then
+            WIFI_MODULE="$_m"
+            log "detect_wifi_module: found '$WIFI_MODULE' via sysfs"
+            return 0
+        fi
+    fi
+    # Method 2: check lsmod (flexible matching)
+    for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        if lsmod 2>/dev/null | grep -q "$_mod"; then
+            WIFI_MODULE="$_mod"
+            log "detect_wifi_module: found '$WIFI_MODULE' via lsmod"
+            return 0
+        fi
+    done
+    # Method 3: check /proc/modules directly (some Kindles lack lsmod)
+    for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        if grep -q "$_mod" /proc/modules 2>/dev/null; then
+            WIFI_MODULE="$_mod"
+            log "detect_wifi_module: found '$WIFI_MODULE' via /proc/modules"
+            return 0
+        fi
+    done
+    return 1
+}
+
+WIFI_MODULE=""
+detect_wifi_module || log "detect_wifi_module: no module found at startup (will retry after first wifi_on)"
+
 wifi_on() {
     log "wifi_on: ensuring powerd is running"
-    # powerd should already be running (not frozen during suspend)
-    # but thaw it just in case
     killall -CONT powerd 2>/dev/null
     sleep 1
 
-    # Ensure clean state: kill any stale wpa_supplicant left from a
-    # previous failed recovery cycle. A leftover daemon blocks the
-    # framework from starting its own, causing all future connects to fail.
+    # Ensure WiFi interface exists (module loaded)
+    if ! ifconfig wlan0 >/dev/null 2>&1; then
+        log "wifi_on: wlan0 missing, attempting to reload WiFi module"
+        # Try common Kindle WiFi modules
+        for mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+            modprobe "$mod" 2>/dev/null && break
+        done
+        sleep 3
+        if ! ifconfig wlan0 >/dev/null 2>&1; then
+            log "wifi_on: wlan0 still missing after modprobe, cannot recover"
+            return 1
+        fi
+        log "wifi_on: wlan0 restored after modprobe"
+    fi
+
+    # Kill stale wpa_supplicant from a previous failed cycle
     if pidof wpa_supplicant >/dev/null 2>&1; then
-        log "wifi_on: killing stale wpa_supplicant from previous cycle"
+        log "wifi_on: killing stale wpa_supplicant"
         killall wpa_supplicant 2>/dev/null
         sleep 1
     fi
 
-    # Log current WiFi state before attempting connection
     CM_PRE=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
     log "wifi_on: pre-enable cmState='$CM_PRE'"
 
-    # Try up to 6 attempts with increasingly aggressive resets:
-    # 1) Normal enable  2) lipc power-cycle  3) Kernel-level driver reset
-    # 4) rfkill hardware power-cycle  5) Restart wifid daemon
-    # 6) Bypass framework: manual wpa_supplicant + DHCP
+    # Simple 3-attempt strategy: enable, disable+re-enable, restart wifid
+    # Avoids destructive actions (rmmod, rfkill, manual bypass) that
+    # destabilize the WiFi stack across suspend cycles.
     ATTEMPT=1
-    MAX_ATTEMPTS=6
+    MAX_ATTEMPTS=3
     while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
         log "wifi_on: attempt $ATTEMPT/$MAX_ATTEMPTS - enabling wireless"
         lipc-set-prop com.lab126.cmd wirelessEnable 1
 
-        # Wait for WiFi to connect (max 20 seconds per attempt)
+        # Wait for connection (max 30 seconds)
         TRIES=0
-        while [ $TRIES -lt 20 ]; do
+        while [ $TRIES -lt 30 ]; do
             if lipc-get-prop com.lab126.wifid cmState 2>/dev/null | grep -q CONNECTED; then
                 log "wifi_on: connected after ${TRIES}s (attempt $ATTEMPT)"
                 sleep 1
+                WIFI_FAIL_COUNT=0
+                # Detect WiFi module now that wlan0 is up (if not yet known)
+                if [ -z "$WIFI_MODULE" ]; then
+                    detect_wifi_module || true
+                fi
                 return 0
             fi
             sleep 1
             TRIES=$((TRIES + 1))
         done
 
-        log "wifi_on: attempt $ATTEMPT failed after 20s"
+        log "wifi_on: attempt $ATTEMPT failed after 30s"
 
         if [ $ATTEMPT -eq 1 ]; then
-            # Attempt 1 failed: soft power-cycle via framework
-            log "wifi_on: soft power-cycle (lipc disable/enable)"
+            # Soft power-cycle via framework
+            log "wifi_on: soft power-cycle (disable/enable)"
             lipc-set-prop com.lab126.cmd wirelessEnable 0
-            sleep 3
+            sleep 5
         elif [ $ATTEMPT -eq 2 ]; then
-            # Attempt 2 failed: hard reset at kernel level
-            log "wifi_on: HARD RESET - reloading WiFi driver"
-            lipc-set-prop com.lab126.cmd wirelessEnable 0
-            sleep 1
-
-            # Bring interface down
-            ifconfig wlan0 down 2>/dev/null
-            sleep 1
-
-            # Find and reload the WiFi kernel module
-            # Common Kindle WiFi modules: wlcore_sdio, wl18xx, ar6003, brcmfmac
-            WIFI_MOD=$(lsmod 2>/dev/null | awk '/wl|ar6|brcm|8189|mlan/{print $1; exit}')
-            if [ -n "$WIFI_MOD" ]; then
-                log "wifi_on: unloading module '$WIFI_MOD'"
-                rmmod "$WIFI_MOD" 2>/dev/null
-                sleep 2
-                modprobe "$WIFI_MOD" 2>/dev/null
-                sleep 2
-            else
-                log "wifi_on: no WiFi module identified, using ifconfig reset"
-            fi
-
-            # Bring interface back up
-            ifconfig wlan0 up 2>/dev/null
-            sleep 2
-
-            # Restart wpa_supplicant if it died
-            if ! pidof wpa_supplicant >/dev/null 2>&1; then
-                log "wifi_on: restarting wpa_supplicant"
-                wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null \
-                    || wpa_supplicant -B -i wlan0 -c /var/run/wpa_supplicant.conf 2>/dev/null
-                sleep 2
-            else
-                # Force reassociate
-                wpa_cli -i wlan0 disconnect 2>/dev/null
-                wpa_cli -i wlan0 reassociate 2>/dev/null
-            fi
-            sleep 2
-        elif [ $ATTEMPT -eq 3 ]; then
-            # Attempt 3 failed: rfkill hardware power-cycle
-            # This cuts power to the WiFi chip via GPIO, which can recover
-            # a hung chip firmware that software resets cannot fix.
-            log "wifi_on: RFKILL power-cycle - cutting chip power via GPIO"
-            lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
-            sleep 1
-            rfkill block wifi 2>/dev/null
-            sleep 3
-            rfkill unblock wifi 2>/dev/null
-            sleep 3
-            # Bring interface back up after hardware power-cycle
-            ifconfig wlan0 up 2>/dev/null
-            sleep 2
-            # Ensure wpa_supplicant is running
-            if ! pidof wpa_supplicant >/dev/null 2>&1; then
-                log "wifi_on: restarting wpa_supplicant after rfkill"
-                wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null \
-                    || wpa_supplicant -B -i wlan0 -c /var/run/wpa_supplicant.conf 2>/dev/null
-                sleep 2
-            fi
-        elif [ $ATTEMPT -eq 4 ]; then
-            # Attempt 4 failed: restart the wifid daemon entirely.
-            # The framework state machine can get permanently stuck in a
-            # state where it refuses to connect. Restarting wifid resets
-            # its internal state without a full reboot.
-            log "wifi_on: RESTARTING wifid daemon"
+            # Restart wifid to reset framework state machine
+            log "wifi_on: restarting wifid"
             lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
             killall wpa_supplicant 2>/dev/null
             stop wifid 2>/dev/null
             sleep 3
             start wifid 2>/dev/null
             sleep 3
-        elif [ $ATTEMPT -eq 5 ]; then
-            # Attempt 5 failed: bypass the Kindle framework entirely.
-            # Connect directly with wpa_supplicant + DHCP, ignoring wifid/lipc.
-            # This works even when the framework is completely broken.
-            log "wifi_on: BYPASS FRAMEWORK - manual wpa_supplicant + DHCP"
-            lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
-            stop wifid 2>/dev/null
-            killall wpa_supplicant 2>/dev/null
-            killall udhcpc 2>/dev/null
-            sleep 2
-
-            # Reset hardware
-            rfkill unblock wifi 2>/dev/null
-            ifconfig wlan0 up 2>/dev/null
-            sleep 2
-
-            # Find wpa_supplicant config
-            WPA_CONF=""
-            for f in /etc/wpa_supplicant/wpa_supplicant.conf \
-                     /var/run/wpa_supplicant.conf \
-                     /etc/wpa_supplicant.conf \
-                     /mnt/us/extensions/dashboard/wpa_supplicant.conf; do
-                if [ -f "$f" ]; then
-                    WPA_CONF="$f"
-                    break
-                fi
-            done
-
-            if [ -n "$WPA_CONF" ]; then
-                log "wifi_on: manual connect using $WPA_CONF"
-                wpa_supplicant -B -i wlan0 -c "$WPA_CONF" 2>/dev/null
-                sleep 3
-
-                # Wait for association (up to 15s)
-                ASSOC_TRIES=0
-                while [ $ASSOC_TRIES -lt 15 ]; do
-                    if wpa_cli -i wlan0 status 2>/dev/null | grep -q "wpa_state=COMPLETED"; then
-                        log "wifi_on: manual association successful"
-                        break
-                    fi
-                    sleep 1
-                    ASSOC_TRIES=$((ASSOC_TRIES + 1))
-                done
-
-                # Get IP via DHCP
-                if wpa_cli -i wlan0 status 2>/dev/null | grep -q "wpa_state=COMPLETED"; then
-                    udhcpc -i wlan0 -t 5 -T 3 -n -q 2>/dev/null
-                    sleep 2
-                    # Check if we got an IP
-                    if ifconfig wlan0 2>/dev/null | grep -q "inet addr"; then
-                        log "wifi_on: MANUAL CONNECTION SUCCESSFUL (bypassed framework)"
-                        # Restart wifid so wifi_off() works normally
-                        start wifid 2>/dev/null
-                        sleep 1
-                        return 0
-                    fi
-                    log "wifi_on: DHCP failed in manual mode"
-                else
-                    log "wifi_on: manual association failed after 15s"
-                fi
-            else
-                log "wifi_on: no wpa_supplicant.conf found for manual mode"
-            fi
-
-            # Clean up failed manual attempt, restart wifid for next cycle
-            killall wpa_supplicant 2>/dev/null
-            killall udhcpc 2>/dev/null
-            start wifid 2>/dev/null
-            sleep 2
         fi
 
         ATTEMPT=$((ATTEMPT + 1))
     done
-    log "wifi_on: FAILED to connect after $MAX_ATTEMPTS attempts (incl. rfkill, wifid restart, manual bypass)"
+
+    WIFI_FAIL_COUNT=$((WIFI_FAIL_COUNT + 1))
+    log "wifi_on: FAILED after $MAX_ATTEMPTS attempts (consecutive failures: $WIFI_FAIL_COUNT)"
     return 1
 }
 
 wifi_off() {
-    log "wifi_off: disabling wireless, freezing blanket"
+    log "wifi_off: disabling wireless"
     # Freeze blanket BEFORE disabling WiFi so it cannot react to the
     # WiFi state change and draw the airplane icon / status bar.
     killall -STOP blanket 2>/dev/null
 
-    # Disable WiFi – powerd stays running so it can properly manage
-    # the WiFi chip power state during suspend/resume.
+    # Disable WiFi via framework (clean shutdown)
     lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
-    sleep 1
+    sleep 2
 
-    # Clean up any leftover state from failed recovery attempts.
-    # The aggressive escalation (attempts 2-4) manually starts
-    # wpa_supplicant and manipulates rfkill/ifconfig. These changes
-    # bypass the framework and persist across suspend/resume, causing
-    # the NEXT wifi_on to fail permanently.
+    # Kill any leftover wpa_supplicant (in case framework didn't clean up)
     killall wpa_supplicant 2>/dev/null
-    rfkill unblock wifi 2>/dev/null
-    ifconfig wlan0 down 2>/dev/null
+
+    # Ensure wifid is still running (needed for next wifi_on)
+    pidof wifid >/dev/null 2>&1 || start wifid 2>/dev/null
 }
 
 # Returns the interval in minutes based on time of day
@@ -373,6 +290,38 @@ do_suspend() {
     # Prevent the system from entering hibernate (deeper than suspend-to-RAM).
     echo 0 > /sys/power/hibernate_allowed 2>/dev/null
 
+    # Unload WiFi kernel module before suspend. Without this, the driver
+    # remains loaded while the SDIO chip is powered off, leaving it in an
+    # unrecoverable state on resume. A clean rmmod+modprobe cycle gives
+    # the hardware a fresh initialization each time.
+    killall wpa_supplicant 2>/dev/null
+    stop wifid 2>/dev/null
+    sleep 1
+    if [ -n "$WIFI_MODULE" ]; then
+        rmmod "$WIFI_MODULE" 2>/dev/null
+        log "do_suspend: unloaded WiFi module $WIFI_MODULE (rc=$?)"
+    else
+        # Module name unknown: try to unload all known WiFi modules
+        log "do_suspend: WIFI_MODULE unknown, trying all known modules"
+        for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+            rmmod "$_mod" 2>/dev/null
+        done
+    fi
+
+    # Disable wakeup sources that cause spurious resume.
+    # Without this, the WiFi chip (even when broken/unloaded) or USB can
+    # generate interrupts that wake the device seconds after suspend.
+    for ws in /sys/class/wakeup/*/device/power/wakeup; do
+        [ -e "$ws" ] && echo disabled > "$ws" 2>/dev/null
+    done
+    # Keep only RTC as a wakeup source
+    for ws in /sys/bus/sdio/devices/*/power/wakeup; do
+        [ -e "$ws" ] && echo disabled > "$ws" 2>/dev/null
+    done
+    for ws in /sys/bus/usb/devices/*/power/wakeup; do
+        [ -e "$ws" ] && echo disabled > "$ws" 2>/dev/null
+    done
+
     # Prefer rtcwake (cleanest API)
     if command -v rtcwake >/dev/null 2>&1; then
         rtcwake -d /dev/rtc0 -m mem -s "$SECONDS_TO_SLEEP" 2>/dev/null
@@ -394,59 +343,79 @@ do_suspend() {
     sleep "$SECONDS_TO_SLEEP"
 }
 
-# After resume from suspend, re-establish our display lock:
-# powerd/mesquite may try to reclaim the framebuffer on wake.
+# After resume from suspend, re-establish our display lock.
 post_wake() {
     log "post_wake: re-establishing display lock"
-    # powerd is already running (not frozen during suspend) so it has
-    # already processed the resume event and reinitialized hardware.
-    # Give it a moment to finish its resume handlers.
-    sleep 3
+    sleep 2
 
-    # Prevent powerd from entering deeper sleep states (hibernate)
+    # Reset powerd idle timer IMMEDIATELY. Without this, powerd accumulates
+    # idle time across suspend cycles and eventually forces hibernate
+    # (deeper than suspend-to-RAM), which kills our process.
+    lipc-set-prop com.lab126.powerd wakeUp 1 2>/dev/null
+    lipc-send-event com.lab126.powerd wakeUp 2>/dev/null
+
+    # Prevent screensaver
     lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
 
-    # Log WiFi chip state for diagnostics
-    WLAN_STATE=$(ifconfig wlan0 2>/dev/null | head -1)
-    CM_STATE=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
-    log "post_wake: wlan0='$WLAN_STATE' cmState='$CM_STATE'"
-
-    # Reset framebuffer bit depth. After multiple suspend/resume cycles
-    # the kernel may switch the framebuffer format (e.g. 8bpp -> 32bpp)
-    # causing black screen + stripe artifacts. fbdepth forces it back
-    # to 8bpp grayscale which fbink expects.
-    FB_BPP_BEFORE=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
-    log "post_wake: resetting framebuffer depth"
-    $BASEDIR/bin/fbdepth -d 8 2>/dev/null
-
-    # Log framebuffer state for diagnostics
-    FB_STATE=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
-    log "post_wake: fb0 bpp=$FB_STATE"
-
-    # If bit depth actually changed, the framebuffer content is corrupted.
-    # Repaint the last image so the display isn't garbled.
-    FB_CHANGED=0
-    if [ "$FB_BPP_BEFORE" != "8" ] && [ -f "$IMG" ]; then
-        log "post_wake: bpp changed ($FB_BPP_BEFORE->8), repainting last image"
-        $FBINK -q -f -g file="$IMG"
-        FB_CHANGED=1
+    # Reload WiFi kernel module (was unloaded before suspend in do_suspend).
+    # This gives the driver a fresh start with properly powered hardware.
+    if [ -n "$WIFI_MODULE" ]; then
+        modprobe "$WIFI_MODULE" 2>/dev/null
+        sleep 3
+        if ifconfig wlan0 >/dev/null 2>&1; then
+            log "post_wake: wlan0 restored via modprobe $WIFI_MODULE"
+        else
+            # Module loaded but interface missing: try rmmod+modprobe cycle
+            log "post_wake: wlan0 missing after modprobe, retrying rmmod+modprobe"
+            rmmod "$WIFI_MODULE" 2>/dev/null
+            sleep 1
+            modprobe "$WIFI_MODULE" 2>/dev/null
+            sleep 3
+            if ifconfig wlan0 >/dev/null 2>&1; then
+                log "post_wake: wlan0 restored on retry"
+            else
+                log "post_wake: wlan0 still missing after retry"
+            fi
+        fi
+    else
+        # Module name unknown: try rmmod+modprobe of all known modules
+        log "post_wake: WIFI_MODULE unknown, trying rmmod+modprobe of all known modules"
+        for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+            rmmod "$_mod" 2>/dev/null
+        done
+        sleep 1
+        for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+            modprobe "$_mod" 2>/dev/null
+            sleep 2
+            if ifconfig wlan0 >/dev/null 2>&1; then
+                log "post_wake: wlan0 restored via modprobe $_mod"
+                # Now we know the module name for next time
+                WIFI_MODULE="$_mod"
+                break
+            fi
+            rmmod "$_mod" 2>/dev/null
+        done
+        if ! ifconfig wlan0 >/dev/null 2>&1; then
+            log "post_wake: wlan0 still missing after trying all modules"
+        fi
     fi
-
-    # NOTE: Do NOT clear the screen here. The e-ink panel retains its
-    # image across suspend-to-RAM without power. Clearing would destroy
-    # the displayed dashboard and force a repaint even when WiFi fails.
-    # The EPDC wakes automatically when the next fbink draw command is
-    # issued (in update.sh on successful fetch).
-    log "post_wake: e-ink ready (image retained)"
-
-    # Thaw blanket briefly so it can process D-Bus unload commands.
-    # If blanket is still SIGSTOP'd from the previous wifi_off(), lipc
-    # commands would hang until timeout (~7s each), delaying wifi_on and
-    # destabilising the WiFi stack.
-    killall -CONT blanket 2>/dev/null
+    start wifid 2>/dev/null
     sleep 1
 
-    # Re-disable Pillow UI overlay and blanket modules
+    # Reset framebuffer bit depth if needed
+    FB_BPP=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
+    if [ "$FB_BPP" != "8" ]; then
+        log "post_wake: fb bpp=$FB_BPP, resetting to 8"
+        $BASEDIR/bin/fbdepth -d 8 2>/dev/null
+        # Repaint last image if we had to change depth
+        if [ -f "$IMG" ]; then
+            $FBINK -q -f -g file="$IMG"
+        fi
+    fi
+
+    # Re-disable UI overlays (blanket must be running for lipc to work)
+    killall -CONT blanket 2>/dev/null
+    sleep 1
     lipc-set-prop com.lab126.pillow disableEnablePillow disable 2>/dev/null
     lipc-set-prop com.lab126.blanket unload screensaver 2>/dev/null
     lipc-set-prop com.lab126.blanket unload active_status_bar 2>/dev/null
@@ -455,15 +424,14 @@ post_wake() {
     killall -STOP blanket 2>/dev/null
     killall -STOP mesquite 2>/dev/null
 
-    # Re-kill frontlight in case resume re-enabled it
+    # Kill frontlight
     lipc-set-prop com.lab126.powerd flIntensity 0 2>/dev/null
     lipc-set-prop com.lab126.powerd flEnable 0 2>/dev/null
     for bl in /sys/class/backlight/*/brightness; do
         [ -e "$bl" ] && echo 0 > "$bl" 2>/dev/null
     done
 
-    # NOTE: Do NOT freeze powerd here – wifi_on needs it running.
-    # powerd will be frozen inside wifi_off() after WiFi is disabled.
+    log "post_wake: done"
 }
 
 COUNTER=1
@@ -475,6 +443,35 @@ do
 
     # --- Device just woke up ---
     log "--- Wake cycle $COUNTER (woke at $(date '+%H:%M:%S')) ---"
+
+    # If WiFi has failed many consecutive times, do a full stack reset
+    # before trying again. This recovers from states where wifid or the
+    # WiFi module are permanently stuck.
+    if [ $WIFI_FAIL_COUNT -ge 3 ]; then
+        log "wifi: $WIFI_FAIL_COUNT consecutive failures, full stack reset"
+        killall wpa_supplicant 2>/dev/null
+        stop wifid 2>/dev/null
+        sleep 2
+        # Force rmmod+modprobe cycle for clean hardware reset
+        if [ -n "$WIFI_MODULE" ]; then
+            rmmod "$WIFI_MODULE" 2>/dev/null
+            sleep 1
+            modprobe "$WIFI_MODULE" 2>/dev/null
+        else
+            for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+                rmmod "$_mod" 2>/dev/null
+            done
+            sleep 1
+            for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+                modprobe "$_mod" 2>/dev/null && break
+            done
+        fi
+        sleep 3
+        start wifid 2>/dev/null
+        sleep 3
+        WIFI_FAIL_COUNT=0
+    fi
+
     post_wake
 
     # Enable WiFi, update, disable WiFi

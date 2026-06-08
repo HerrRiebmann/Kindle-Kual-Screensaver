@@ -3,70 +3,100 @@
 BASEDIR="/mnt/us/extensions/dashboard"
 PIDFILE="$BASEDIR/pid"
 FBINK="$BASEDIR/bin/fbink"
+LOG="$BASEDIR/stop.log"
 
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
+}
+
+log "=== stop.sh starting ==="
+
+# --- 0. Kill the dashboard process ---
 if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")
+    log "Killing dashboard PID $PID"
 
-    # Kill child processes first (sleep, update.sh, curl, etc.)
-    # so the subshell isn't blocked waiting on a foreground child.
     for child in $(ps -o pid,ppid 2>/dev/null | awk -v p="$PID" '$2==p {print $1}'); do
         kill "$child" 2>/dev/null
     done
 
-    # Now kill the subshell itself – trap should fire
     kill "$PID" 2>/dev/null
-
-    # Give the trap handler a moment to run
     sleep 2
 
-    # Force-kill if still alive
-    kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
+    if kill -0 "$PID" 2>/dev/null; then
+        log "PID $PID still alive, force-killing"
+        kill -9 "$PID" 2>/dev/null
+    fi
 
     rm -f "$PIDFILE"
+    log "Dashboard process killed"
+else
+    log "No pidfile found, nothing to kill"
 fi
 
-# Safety net: restore critical state even if the subshell trap didn't fire.
+# === RESTORE SYSTEM STATE ===
+# Core insight: powerd has accumulated hours/days of idle time while frozen.
+# wakeUp events do NOT reset this internal counter. The ONLY reliable fix
+# is to restart powerd entirely so it starts with a fresh idle timer.
 
-# --- 1. Thaw powerd FIRST (needed for all subsequent lipc calls) ---
-killall -CONT powerd 2>/dev/null
-sleep 1
-
-# --- 2. Reset powerd idle timer IMMEDIATELY ---
-# powerd has accumulated hours/days of idle time from auto.sh.
-# If we don't reset now, any screensaver/sleep logic will trigger instantly.
-lipc-set-prop com.lab126.powerd wakeUp 1 2>/dev/null
-lipc-send-event com.lab126.powerd wakeUp 2>/dev/null
-# Block screensaver until UI is fully restored
-lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
-
-# --- 3. Clear any pending RTC wake alarm ---
-[ -e /sys/class/rtc/rtc0/wakealarm ] && echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
-
-# --- 4. Restore framebuffer to native bit depth ---
-# auto.sh forces 8bpp via fbdepth; the framework expects 32bpp.
+# --- 1. Restore framebuffer to 32bpp BEFORE thawing UI ---
+log "Step 1: Restoring framebuffer to 32bpp"
 if [ -x "$BASEDIR/bin/fbdepth" ]; then
     $BASEDIR/bin/fbdepth -d 32 2>/dev/null
 fi
 
-# --- 5. Re-enable frontlight hardware ---
+# --- 2. Thaw powerd temporarily for lipc calls ---
+log "Step 2: Thawing powerd temporarily"
+killall -CONT powerd 2>/dev/null
+sleep 1
+
+# Block screensaver while we're restoring (powerd still has stale state)
+lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
+
+# --- 3. Clear RTC wake alarm ---
+log "Step 3: Clearing RTC wake alarm"
+[ -e /sys/class/rtc/rtc0/wakealarm ] && echo 0 > /sys/class/rtc/rtc0/wakealarm 2>/dev/null
+
+# --- 4. Restore WiFi ---
+log "Step 4: Restoring WiFi"
+if ! ifconfig wlan0 >/dev/null 2>&1; then
+    log "wlan0 missing, loading WiFi module"
+    for mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        modprobe "$mod" 2>/dev/null && break
+    done
+    sleep 3
+    if ifconfig wlan0 >/dev/null 2>&1; then
+        log "wlan0 restored"
+    else
+        log "WARNING: wlan0 still missing"
+    fi
+else
+    log "wlan0 already present"
+fi
+killall wpa_supplicant 2>/dev/null
+pidof wifid >/dev/null 2>&1 || start wifid 2>/dev/null
+sleep 1
+lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
+
+# --- 5. Restore power management + frontlight ---
+log "Step 5: Restoring power mgmt + frontlight"
+echo 1 > /sys/power/hibernate_allowed 2>/dev/null
 for bp in /sys/class/backlight/*/bl_power; do
-    [ -e "$bp" ] && echo 0 > "$bp" 2>/dev/null   # FB_BLANK_UNBLANK = 0
+    [ -e "$bp" ] && echo 0 > "$bp" 2>/dev/null
 done
 lipc-set-prop com.lab126.powerd flEnable 1 2>/dev/null
 
-# --- 6. Restore power management settings ---
-echo 1 > /sys/power/hibernate_allowed 2>/dev/null
-
-# --- 7. Re-enable WiFi ---
-lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
-
-# --- 8. Thaw blanket, re-enable Pillow, reload UI modules ---
+# --- 6. Thaw + re-enable blanket/Pillow ---
+log "Step 6: Thawing blanket + enabling Pillow"
 killall -CONT blanket 2>/dev/null
 sleep 1
 lipc-set-prop com.lab126.pillow disableEnablePillow enable 2>/dev/null
+sleep 1
 lipc-set-prop com.lab126.blanket load active_status_bar 2>/dev/null
+lipc-set-prop com.lab126.blanket load screensaver 2>/dev/null
 
-# --- 9. Restart services that were stopped by auto.sh ---
+# --- 7. Restart stopped services ---
+log "Step 7: Restarting stopped services"
 start otaupd 2>/dev/null
 start phd 2>/dev/null
 start tmd 2>/dev/null
@@ -75,22 +105,30 @@ start todo 2>/dev/null
 start archive 2>/dev/null
 start searchd 2>/dev/null
 
-# --- 10. Thaw mesquite so it redraws the home screen ---
+# --- 8. Thaw mesquite ---
+log "Step 8: Thawing mesquite"
 killall -CONT mesquite 2>/dev/null
+sleep 1
 
-# Give mesquite + blanket time to redraw
+# --- 9. RESTART powerd to reset its internal idle timer ---
+# This is the critical step. wakeUp events do NOT reset powerd's internal
+# idle counter. After being frozen for hours, powerd will immediately
+# trigger screensaver (= black screen + touch disabled) the moment
+# preventScreenSaver is released. The only reliable fix is a full restart.
+log "Step 9: Restarting powerd (fresh idle timer)"
+stop powerd 2>/dev/null
+sleep 2
+start powerd 2>/dev/null
 sleep 3
+log "Step 9: powerd restarted, pid=$(pidof powerd 2>/dev/null || echo 'NOT RUNNING')"
 
-# --- 11. Load screensaver module AFTER UI is drawn ---
-# Must happen after mesquite has redrawn, otherwise screensaver
-# could overwrite the home screen immediately.
-lipc-set-prop com.lab126.blanket load screensaver 2>/dev/null
+# After restart, powerd is in clean "awake" state with normal screensaver
+# timeout (typically 5-10 minutes). No need for preventScreenSaver hacks.
 
-# --- 12. Final e-ink refresh to sync panel with framebuffer ---
-if [ -x "$FBINK" ]; then
-    $FBINK -f 2>/dev/null
-fi
+# --- 10. Trigger home screen redraw ---
+# powerd restart may have triggered a screen update; ensure home screen
+# is properly drawn.
+log "Step 10: Triggering home screen redraw"
+lipc-set-prop com.lab126.appmgrd start app://com.lab126.booklet.home 2>/dev/null
 
-# --- 13. Release screensaver lock ---
-# powerd idle timer was already reset in step 2, so this is safe now.
-lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null
+log "=== stop.sh complete ==="
