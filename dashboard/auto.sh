@@ -44,8 +44,8 @@ lipc-set-prop com.lab126.blanket unload active_status_bar 2>/dev/null
 # notifications, dialogs) on the framebuffer again.
 killall -STOP blanket 2>/dev/null
 
-# NOTE: Do NOT freeze powerd here. WiFi control requires powerd to be
-# running. powerd will be frozen inside wifi_off() after WiFi is disabled.
+# NOTE: powerd is stopped/started around each suspend cycle in do_suspend/
+# post_wake. It must be running during the active phase for WiFi control.
 
 # Stop unnecessary background services to reduce CPU/power usage
 stop otaupd 2>/dev/null          # OTA update daemon
@@ -54,6 +54,7 @@ stop tmd 2>/dev/null             # transfer manager daemon
 stop webreader 2>/dev/null       # Kindle cloud reader
 stop todo 2>/dev/null            # to-do list service
 stop archive 2>/dev/null         # archive manager
+stop fastmetrics 2>/dev/null     # crash reporter (generates .sdr dump files)
 
 # Disable indexing to prevent CPU wakeups
 stop searchd 2>/dev/null
@@ -65,7 +66,7 @@ echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
 killall -STOP mesquite 2>/dev/null
 
 (
-trap 'killall -CONT blanket 2>/dev/null; killall -CONT powerd 2>/dev/null; killall -CONT mesquite 2>/dev/null; lipc-set-prop com.lab126.cmd wirelessEnable 1; lipc-set-prop com.lab126.pillow disableEnablePillow enable; rm -f "$PIDFILE"' EXIT INT TERM
+trap 'killall -CONT blanket 2>/dev/null; start powerd 2>/dev/null; killall -CONT mesquite 2>/dev/null; lipc-set-prop com.lab126.cmd wirelessEnable 1; lipc-set-prop com.lab126.pillow disableEnablePillow enable; rm -f "$PIDFILE"' EXIT INT TERM
 
 LOG="/mnt/us/extensions/dashboard/dashboard.log"
 log() {
@@ -88,7 +89,7 @@ detect_wifi_module() {
         fi
     fi
     # Method 2: check lsmod (flexible matching)
-    for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+    for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
         if lsmod 2>/dev/null | grep -q "$_mod"; then
             WIFI_MODULE="$_mod"
             log "detect_wifi_module: found '$WIFI_MODULE' via lsmod"
@@ -96,7 +97,7 @@ detect_wifi_module() {
         fi
     done
     # Method 3: check /proc/modules directly (some Kindles lack lsmod)
-    for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+    for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
         if grep -q "$_mod" /proc/modules 2>/dev/null; then
             WIFI_MODULE="$_mod"
             log "detect_wifi_module: found '$WIFI_MODULE' via /proc/modules"
@@ -111,14 +112,17 @@ detect_wifi_module || log "detect_wifi_module: no module found at startup (will 
 
 wifi_on() {
     log "wifi_on: ensuring powerd is running"
-    killall -CONT powerd 2>/dev/null
-    sleep 1
+    # powerd is restarted in post_wake; verify it's up
+    if ! pidof powerd >/dev/null 2>&1; then
+        start powerd 2>/dev/null
+        sleep 1
+    fi
 
     # Ensure WiFi interface exists (module loaded)
     if ! ifconfig wlan0 >/dev/null 2>&1; then
         log "wifi_on: wlan0 missing, attempting to reload WiFi module"
         # Try common Kindle WiFi modules
-        for mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        for mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
             modprobe "$mod" 2>/dev/null && break
         done
         sleep 3
@@ -278,10 +282,9 @@ do_suspend() {
     SECONDS_TO_SLEEP=$1
     log "Suspending for ${SECONDS_TO_SLEEP}s"
 
-    # Do NOT freeze powerd here. It must remain running so it can:
-    # 1) Properly manage WiFi chip power state during suspend
-    # 2) Process the resume event and reinitialize WiFi hardware
-    # Screensaver is prevented via preventScreenSaver property.
+    # Freeze powerd's screensaver but keep it runnable until we freeze it
+    # just before rtcwake. WiFi control during the active phase requires
+    # powerd to be running.
     lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
 
     # Freeze mesquite (home screen) to prevent any UI drawing
@@ -296,14 +299,26 @@ do_suspend() {
     # the hardware a fresh initialization each time.
     killall wpa_supplicant 2>/dev/null
     stop wifid 2>/dev/null
+    sleep 2
+    # Bring interface down explicitly before rmmod (prevents "module in use")
+    ifconfig wlan0 down 2>/dev/null
     sleep 1
     if [ -n "$WIFI_MODULE" ]; then
         rmmod "$WIFI_MODULE" 2>/dev/null
-        log "do_suspend: unloaded WiFi module $WIFI_MODULE (rc=$?)"
+        _rc=$?
+        if [ $_rc -ne 0 ]; then
+            log "do_suspend: rmmod $WIFI_MODULE failed (rc=$_rc), retrying after cleanup"
+            killall wpa_supplicant 2>/dev/null
+            ifconfig wlan0 down 2>/dev/null
+            sleep 2
+            rmmod "$WIFI_MODULE" 2>/dev/null
+            _rc=$?
+        fi
+        log "do_suspend: unloaded WiFi module $WIFI_MODULE (rc=$_rc)"
     else
         # Module name unknown: try to unload all known WiFi modules
         log "do_suspend: WIFI_MODULE unknown, trying all known modules"
-        for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
             rmmod "$_mod" 2>/dev/null
         done
     fi
@@ -321,6 +336,15 @@ do_suspend() {
     for ws in /sys/bus/usb/devices/*/power/wakeup; do
         [ -e "$ws" ] && echo disabled > "$ws" 2>/dev/null
     done
+
+    # Stop powerd entirely before suspend. Using 'stop' (upstart) rather
+    # than 'killall -STOP' (freeze). A frozen powerd triggers the kernel
+    # watchdog which kills it; upstart then respawns a fresh powerd that
+    # has no knowledge of our rtcwake and forces deep sleep (exit 143).
+    # 'stop powerd' cleanly terminates it without watchdog issues and
+    # upstart will NOT auto-respawn a stopped service.
+    stop powerd 2>/dev/null
+    sleep 1
 
     # Prefer rtcwake (cleanest API)
     if command -v rtcwake >/dev/null 2>&1; then
@@ -348,13 +372,10 @@ post_wake() {
     log "post_wake: re-establishing display lock"
     sleep 2
 
-    # Reset powerd idle timer IMMEDIATELY. Without this, powerd accumulates
-    # idle time across suspend cycles and eventually forces hibernate
-    # (deeper than suspend-to-RAM), which kills our process.
-    lipc-set-prop com.lab126.powerd wakeUp 1 2>/dev/null
-    lipc-send-event com.lab126.powerd wakeUp 2>/dev/null
-
-    # Prevent screensaver
+    # Restart powerd (was stopped in do_suspend). Starting fresh gives it
+    # a clean idle timer. Then immediately block screensaver.
+    start powerd 2>/dev/null
+    sleep 1
     lipc-set-prop com.lab126.powerd preventScreenSaver 1 2>/dev/null
 
     # Reload WiFi kernel module (was unloaded before suspend in do_suspend).
@@ -380,11 +401,11 @@ post_wake() {
     else
         # Module name unknown: try rmmod+modprobe of all known modules
         log "post_wake: WIFI_MODULE unknown, trying rmmod+modprobe of all known modules"
-        for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
             rmmod "$_mod" 2>/dev/null
         done
         sleep 1
-        for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+        for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
             modprobe "$_mod" 2>/dev/null
             sleep 2
             if ifconfig wlan0 >/dev/null 2>&1; then
@@ -458,11 +479,11 @@ do
             sleep 1
             modprobe "$WIFI_MODULE" 2>/dev/null
         else
-            for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+            for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
                 rmmod "$_mod" 2>/dev/null
             done
             sleep 1
-            for _mod in wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
+            for _mod in ath6kl_sdio wlcore_sdio wl18xx ar6003 brcmfmac 8189fs mlan; do
                 modprobe "$_mod" 2>/dev/null && break
             done
         fi
